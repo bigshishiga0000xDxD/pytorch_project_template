@@ -228,9 +228,11 @@ class BaseTrainer:
                         epoch, self._progress(batch_idx), batch["loss"].item()
                     )
                 )
-                self.writer.add_scalar(
-                    "learning rate", self.lr_scheduler.get_last_lr()[0]
-                )
+                if self.lr_scheduler is not None:
+                    lr = self.lr_scheduler.get_last_lr()[0]
+                else:
+                    lr = self.optimizer.param_groups[0]["lr"]
+                self.writer.add_scalar("learning rate", lr)
                 self._log_scalars(self.train_metrics)
                 self._log_batch(batch_idx, batch)
                 # we don't want to reset train metrics at the start of every epoch
@@ -468,10 +470,11 @@ class BaseTrainer:
             "epoch": epoch,
             "state_dict": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
-            "lr_scheduler": self.lr_scheduler.state_dict(),
             "monitor_best": self.mnt_best,
             "config": self.config,
         }
+        if self.lr_scheduler is not None:
+            state["lr_scheduler"] = self.lr_scheduler.state_dict()
         filename = str(self.checkpoint_dir / f"checkpoint-epoch{epoch}.pth")
         if not (only_best and save_best):
             torch.save(state, filename)
@@ -523,7 +526,8 @@ class BaseTrainer:
             )
         else:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
-            self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
 
         self.logger.info(
             f"Checkpoint loaded. Resume training from epoch {self.start_epoch}"

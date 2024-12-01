@@ -1,5 +1,2 @@
-from src.model.baseline_model import BaselineModel
-
-__all__ = [
-    "BaselineModel",
-]
+from src.model.base_model import BaseModel
+from src.model.mlp import MLPModel
