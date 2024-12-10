@@ -1,13 +1,23 @@
 from abc import abstractmethod
 
 import torch
+from accelerate import PartialState
+from accelerate.utils import InitProcessGroupKwargs
 from numpy import inf
 from torch.nn.utils import clip_grad_norm_
 from tqdm.auto import tqdm
 
 from src.datasets.data_utils import inf_loop
 from src.metrics.tracker import MetricTracker
+from src.utils.init_utils import DummyPartialState
 from src.utils.io_utils import ROOT_PATH
+
+try:
+    kwargs = InitProcessGroupKwargs(...).to_kwargs()
+    kwargs["backend"] = "nccl"
+    distr_state = PartialState(**kwargs)
+except ValueError:
+    distr_state = DummyPartialState()
 
 
 class BaseTrainer:
@@ -30,6 +40,7 @@ class BaseTrainer:
         epoch_len=None,
         skip_oom=True,
         batch_transforms=None,
+        accelerator=None,
     ):
         """
         Args:
@@ -54,6 +65,8 @@ class BaseTrainer:
             batch_transforms (dict[Callable] | None): transforms that
                 should be applied on the whole batch. Depend on the
                 tensor name.
+            accelerator (Accelerator | None): optional instance of
+                `accelerate.Accelerator`.
         """
         self.is_train = True
 
@@ -81,6 +94,9 @@ class BaseTrainer:
             # iteration-based training
             self.train_dataloader = inf_loop(self.train_dataloader)
             self.epoch_len = epoch_len
+
+        if accelerator is not None:
+            self.epoch_len = self.epoch_len // accelerator.num_processes
 
         self.evaluation_dataloaders = {
             k: v for k, v in dataloaders.items() if k != "train"
@@ -142,6 +158,8 @@ class BaseTrainer:
         if config.trainer.get("from_pretrained") is not None:
             self._from_pretrained(config.trainer.get("from_pretrained"))
 
+        self._setup_distributed(accelerator)
+
     def train(self):
         """
         Wrapper around training process to save model on keyboard interrupt.
@@ -180,8 +198,14 @@ class BaseTrainer:
                 logs, not_improved_count
             )
 
+            if self.accelerator is not None:
+                self.accelerator.wait_for_everyone()
+
             if epoch % self.save_period == 0 or best:
                 self._save_checkpoint(epoch, save_best=best, only_best=True)
+
+            if self.accelerator is not None:
+                self.accelerator.wait_for_everyone()
 
             if stop_process:  # early_stop
                 break
@@ -203,7 +227,12 @@ class BaseTrainer:
         self.writer.set_step((epoch - 1) * self.epoch_len)
         self.writer.add_scalar("epoch", epoch)
         for batch_idx, batch in enumerate(
-            tqdm(self.train_dataloader, desc="train", total=self.epoch_len)
+            tqdm(
+                self.train_dataloader,
+                desc="train",
+                total=self.epoch_len,
+                disable=not distr_state.is_main_process,
+            )
         ):
             try:
                 batch = self.process_batch(
@@ -270,6 +299,7 @@ class BaseTrainer:
                 enumerate(dataloader),
                 desc=part,
                 total=len(dataloader),
+                disable=not distr_state.is_main_process,
             ):
                 batch = self.process_batch(
                     batch,
@@ -453,6 +483,7 @@ class BaseTrainer:
         for metric_name in metric_tracker.keys():
             self.writer.add_scalar(f"{metric_name}", metric_tracker.avg(metric_name))
 
+    @distr_state.on_main_process
     def _save_checkpoint(self, epoch, save_best=False, only_best=False):
         """
         Save the checkpoints.
@@ -468,7 +499,7 @@ class BaseTrainer:
         state = {
             "arch": arch,
             "epoch": epoch,
-            "state_dict": self.model.state_dict(),
+            "state_dict": self._unwrapped_model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "monitor_best": self.mnt_best,
             "config": self.config,
@@ -502,7 +533,7 @@ class BaseTrainer:
         """
         resume_path = str(resume_path)
         self.logger.info(f"Loading checkpoint: {resume_path} ...")
-        checkpoint = torch.load(resume_path, self.device)
+        checkpoint = torch.load(resume_path, self.device, weights_only=False)
         self.start_epoch = checkpoint["epoch"] + 1
         self.mnt_best = checkpoint["monitor_best"]
 
@@ -549,9 +580,40 @@ class BaseTrainer:
             self.logger.info(f"Loading model weights from: {pretrained_path} ...")
         else:
             print(f"Loading model weights from: {pretrained_path} ...")
-        checkpoint = torch.load(pretrained_path, self.device)
+        checkpoint = torch.load(pretrained_path, self.device, weights_only=False)
 
         if checkpoint.get("state_dict") is not None:
             self.model.load_state_dict(checkpoint["state_dict"])
         else:
             self.model.load_state_dict(checkpoint)
+
+    def _setup_distributed(self, accelerator):
+        if accelerator:
+            assert (
+                hasattr(self, "model")
+                and hasattr(self, "train_dataloader")
+                and hasattr(self, "lr_scheduler")
+                and hasattr(self, "optimizer")
+                and hasattr(self, "evaluation_dataloaders")
+            )
+            self.accelerator = accelerator
+            self.train_dataloader, self.lr_scheduler = self.accelerator.prepare(
+                self.train_dataloader, self.lr_scheduler
+            )
+            self.evaluation_dataloaders = {
+                k: self.accelerator.prepare(v)
+                for k, v in self.evaluation_dataloaders.items()
+            }
+            self.optimizer = self.accelerator.prepare(self.optimizer)
+
+            self._unwrapped_model = self.model
+            self.model = self.accelerator.prepare(self.model)
+        else:
+            self._unwrapped_model = self.model
+            self.accelerator = None
+
+    def _backward(self, loss):
+        if self.accelerator is not None:
+            self.accelerator.backward(loss)
+        else:
+            loss.backward()

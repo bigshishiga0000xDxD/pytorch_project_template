@@ -160,3 +160,30 @@ def setup_saving_and_logging(config):
     logger.setLevel(logging.DEBUG)
 
     return logger
+
+
+class DummyLogger:
+    """
+    Dummy logging class for the DDP to log only from main process
+    """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __getattr__(self, attr):
+        def func(*args, **kwargs):
+            pass
+
+        return func
+
+
+class DummyPartialState:
+    """
+    Dummy replacement of `accelerate.PartialState` for disabled DDP.
+    """
+
+    is_main_process = True
+
+    @staticmethod
+    def on_main_process(func):
+        return func

@@ -1,3 +1,5 @@
+import torch
+
 from src.metrics.tracker import MetricTracker
 from src.trainer.base_trainer import BaseTrainer
 
@@ -41,7 +43,7 @@ class Trainer(BaseTrainer):
         batch.update(all_losses)
 
         if self.is_train:
-            batch["loss"].backward()  # sum of all losses is always called loss
+            self._backward(batch["loss"])  # sum of all losses is always called loss
             self._clip_grad_norm()
             self.optimizer.step()
             if self.lr_scheduler is not None:
@@ -52,7 +54,13 @@ class Trainer(BaseTrainer):
             metrics.update(loss_name, batch[loss_name].item())
 
         for met in metric_funcs:
-            metrics.update(met.name, met(**batch))
+            value = met(**batch)
+            if self.accelerator is not None:
+                # for distributed validation
+                value_tensor = torch.tensor([value], device=self.accelerator.device)
+                gathered_value = self.accelerator.gather(value_tensor)
+                value = torch.mean(gathered_value).item()
+            metrics.update(met.name, value)
         return batch
 
     def _log_batch(self, batch_idx, batch, mode="train"):
